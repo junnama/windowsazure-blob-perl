@@ -181,7 +181,8 @@ sub rename {
     my $blob = shift;
     my ( $src, $path, $params ) = @_;
     my $res = $blob->copy( $src, $path, $params );
-    return $blob->remove( $src );
+    $blob->remove( $src );
+    return $res;
 }
 
 sub download {
