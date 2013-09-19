@@ -2,7 +2,7 @@ use strict;
 use warnings;
 package WindowsAzure::Blob;
 {
-  $WindowsAzure::Blob::VERSION = '0.12';
+  $WindowsAzure::Blob::VERSION = '0.14';
 }
 use LWP::UserAgent;
 use HTTP::Date;
@@ -56,7 +56,10 @@ sub sign {
     my $method = $req->method;
     my $encoding = $req->header( 'Content-Encoding' ) || '';
     my $language = $req->header( 'Content-Language' ) || '';
-    my $length = $req->header( 'Content-Length' ) || '';
+    my $length = $req->header( 'Content-Length' );
+    if (! defined $length ) {
+        $length = '';
+    }
     my $md5 = $req->header( 'Content-MD5' ) || '';
     my $content_type = $req->header( 'Content-Type' ) || '';
     my $date = $req->header( 'Date' ) || '';
@@ -69,10 +72,27 @@ sub sign {
                     $if_mod_since, $if_match, $if_none_match, $if_unmod_since, $range );
     push ( @headers, "${canonicalized_headers}${canonicalized_resource}" );
     my $string_to_sign = join( "\n", @headers );
+    # print $string_to_sign;
     my $signature = hmac_sha256_base64( $string_to_sign, decode_base64( $key ) );
     $signature .= '=' x ( 4 - ( length( $signature ) % 4 ) );
     $req->authorization( "SharedKey ${account}:${signature}" );
     return $req;
+}
+
+sub create_container {
+    my $blob = shift;
+    my $account = $blob->{ account_name };
+    my ( $name, $params ) = @_;
+    $name =~ s!^/!!;
+    my $data = 'restype=container';
+    my $schema = $blob->{ schema };
+    my $url = "${schema}://${account}.blob.core.windows.net/${name}?${data}";
+    my $req = new HTTP::Request( 'PUT' => $url );
+    $req->content_length( length( $data ) );
+    $req = $blob->sign( $req, $params );
+    $req->content( $data );
+    my $ua = LWP::UserAgent->new;
+    return $ua->request( $req );
 }
 
 sub get {
@@ -88,8 +108,9 @@ sub get {
         $filename = $params->{ filename };
     }
     my $schema = $blob->{ schema };
+    my $request_type = $params->{ request_type } || 'GET';
     my $url = "${schema}://${account}.blob.core.windows.net/${path}";
-    my $req = new HTTP::Request( 'GET', $url );
+    my $req = new HTTP::Request( $request_type, $url );
     $req = $blob->sign( $req, $params );
     my $ua = LWP::UserAgent->new;
     my $res = $ua->request( $req );
@@ -110,6 +131,40 @@ sub get {
         }
     }
     return $res;
+}
+
+sub get_metadata {
+    my $blob = shift;
+    my ( $path, $params ) = @_;
+    $params->{ request_type } = 'HEAD';
+    return $blob->get( $path, $params );
+}
+
+sub set_metadata {
+    my $blob = shift;
+    my $account = $blob->{ account_name };
+    my ( $path, $params ) = @_;
+    $path =~ s!^/!!;
+    if ( my $container_name = $blob->{ container_name } ) {
+        $path = $container_name . '/' . $path;
+    }
+    my $data = 'comp=metadata';
+    my $schema = $blob->{ schema };
+    my $url = "${schema}://${account}.blob.core.windows.net/${path}?${data}";
+    my $req = new HTTP::Request( 'PUT' => $url );
+    my $metadata = $params->{ metadata };
+    for my $key ( keys %$metadata ) {
+        my $meta = $key;
+        if ( $key !~ m/^x\-ms\-meta\-/ ) {
+            $meta = 'x-ms-meta-' . $meta;
+        }
+        $req->header( $meta, $metadata->{ $key } );
+    }
+    $req->content_length( length( $data ) );
+    $req = $blob->sign( $req, $params );
+    $req->content( $data );
+    my $ua = LWP::UserAgent->new;
+    return $ua->request( $req );
 }
 
 sub put {
@@ -137,6 +192,14 @@ sub put {
             $data .= $chunk;
         }
         close $fh;
+        if (! $params->{ no_attributes } ) {
+            my @stats = stat $filename;
+            $req->header( 'x-ms-meta-mode', sprintf( '%o', $stats[ 2 ] ) ); # oct()
+            $req->header( 'x-ms-meta-uid', $stats[ 4 ] );
+            $req->header( 'x-ms-meta-gid', $stats[ 5 ] );
+            $req->header( 'x-ms-meta-mtime', $stats[ 9 ] );
+                        # Custom header for set timestamp and permission.
+        }
     }
     $req->content_length( length $data );
     $req = $blob->sign( $req, $params );
@@ -147,7 +210,6 @@ sub put {
 
 sub upload {
     my $blob = shift;
-    my $account = $blob->{ account_name };
     my ( $path, $filename, $params ) = @_;
     $params->{ filename } = $filename;
     return $blob->put( $path, $params );
@@ -252,6 +314,14 @@ WindowsAzure::Blob - Interface to Windows Azure Blob Service
 
 =head1 METHODS
 
+=head2 create_container
+
+The Create Container operation creates a new container under the specified account.
+If the container with the same name already exists, the operation fails.
+http://msdn.microsoft.com/en-us/library/windowsazure/dd179468.aspx
+
+  my $res = $blob->create_container( $container_name );
+
 =head2 get
 
 The Get Blob operation reads or downloads a blob from the system.
@@ -261,6 +331,13 @@ http://msdn.microsoft.com/en-us/library/windowsazure/dd179440.aspx
 
   my $params = { filename => '/path/to/filename' };
   my $res = $blob->get( $path, $params );  # Get blob and save file
+
+=head2 get_metadata
+
+The Get Blob Metadata operation returns all user-defined metadata for the specified blob
+http://msdn.microsoft.com/en-us/library/windowsazure/dd179350.aspx
+
+  my $res = $blob->get_metadata( $path );
 
 =head2 download
 
@@ -283,6 +360,16 @@ http://msdn.microsoft.com/en-us/library/windowsazure/dd179451.aspx
 Upload a new block blob from local file.
 
   my $res = $blob->upload( $path, $filename );
+
+=head2 set_metadata
+
+The Set Blob Metadata operation sets user-defined metadata for the specified blob as one or more name-value pairs.
+http://msdn.microsoft.com/en-us/library/windowsazure/dd179414.aspx
+
+  my $params = { metadata => { category => 'image'
+                               author => $author_name } };
+  my $res = $blob->get_metadata( $path, $params );
+  # Set x-ms-meta-category and x-ms-meta-author metadata.
 
 =head2 remove
 
